@@ -1,0 +1,498 @@
+---
+title: "logistic"
+output: html_document
+---
+
+
+## 라이브러리와 데이터 로딩
+```{r setup, include=FALSE}
+library("dplyr")
+library('psych')
+library("magrittr")
+library('caret')
+
+df <- read.csv('data_anal2.csv')
+colnames(df)
+```
+
+### 데이터 살펴보기
+```{r}
+
+drops <- c('is_review_comment', 'product_id','product_weight_g',
+           'customer_unique_id','customer_zip_code_prefix','seller_zip_code_prefix'
+           , 'review_ans_time_6', 'seller_state','customer_state')
+df <- df[ , !(names(df) %in% drops)]
+
+#head(df)
+str(df)
+```
+
+```{r}
+ncol(df)
+psych::describe(df)
+summary(df)
+```
+
+```{r}
+
+df[rowSums(is.na(df)) > 0,]
+df[is.na(df)]
+# seller state 결측치 nan으로 표시
+df[c("seller_state")][is.na(df[c("seller_state")])] <- "nan"
+
+```
+
+
+##### 범주형 피처변수(15개)를 순서형 팩터화
+# 범주형 변수를 모두 (순서형)팩터로 변환
+
+```{r}
+
+#names <- c('product_category_name_english',
+#           'order_time_6', 'order_day','del_period_deadline_yn',
+#           'payment_voucher_yn')
+
+names  <- c('order_product_value', 'installments_yn', 'order_day')
+
+df2 <- df
+for (i in names) {
+  subset <- df %>% group_by_at(i) %>% dplyr::summarize(count = n(), countP = sum(pn_review_score == 'Positive'))
+  subset$PosProb <- subset$countP / subset$count
+  orderedLevels <- subset %>% arrange(desc(PosProb)) %>% select(i) %>% unlist(use.names = FALSE)
+  #print(subset)
+  
+  df2[,i] <- factor(df[,i],
+                     levels = orderedLevels,
+                     labels = orderedLevels,
+                     exclude = NULL,
+                     ordered = TRUE)
+}
+
+
+str(df2)
+df2
+
+#aa <- c('pn_review_score','del_period_deadline_yn','del_period_deadline_yn','distance','freight_value_proport#ion','order_product_value','del_period_psy','order_day','installments_yn')
+
+#df3 <- df2[ , (names(df2) %in% aa)]
+#colnames(df3)
+#df2 <- df3
+## 현재 df2 가 최종 df
+```
+
+
+## train & test 데이터 분할
+```{r}
+df2 <- df
+training_Rows <- createDataPartition(df2$pn_review_score, p=0.7, list=FALSE)
+df.train <- df2[training_Rows, ]
+df.test <- df2[-training_Rows, ]
+```
+
+### 잘 분할 됐는지 확인
+```{r}
+df2$pn_review_score %>% table %>% prop.table
+df.train$pn_review_score %>% table %>% prop.table
+df.test$pn_review_score %>% table %>% prop.table
+```
+
+
+
+```{r}
+## data 수치형, 명목형으로 분리
+raw <- df2
+raw <- na.omit(raw)
+str(raw)
+
+num_data <- raw[, sapply(raw, is.numeric)]
+obj_data <- raw[, !sapply(raw, is.numeric)]
+
+```
+
+
+```{r}
+## 공분산 분석(corvariance analysis)
+
+raw.cov <- cov(num_data, use = "complete.obs", method = "pearson")
+raw.cov # 공분산행렬
+round(raw.cov, 3)
+
+cov2cor(raw.cov) # 공분산을 상관계수로 변환해줌
+
+## 상관관계 분석(correlation analysis)
+
+raw.cor <- cor(num_data, use = "complete.obs", method = "pearson") 
+raw.cor # 상관계수행렬
+round(raw.cor, 3)
+
+## install.packages("Hmisc") 패키지 사용
+# - 상관계수값과 통계적 유의수준(p-value)를 같이 구해줌
+library(Hmisc)
+raw.r <- rcorr(as.matrix(num_data))
+# raw.r <- rcorr(as.matrix(raw), type = "pearson")
+#raw.r  
+
+
+
+```
+
+
+### 연속형 변수 상관계수
+```{r}
+library(corrplot)
+
+#png(filename = '연속형변수_cor.png')
+
+corrplot(raw.cor)
+#dev.off()
+
+```
+
+### 범주형 변수 평균차이검증
+```{r}
+getTstats <- function(x,y){
+  tTest <- t.test(y~x)
+  out <- c(tStat = tTest$statistic, p =tTest$p.value)
+  out
+}
+
+# tVals <- apply(obj_data)
+```
+
+
+
+### 분류규칙에 가장 영향을 많이 미치는 변수는 무엇인지를 탐색분석
+
+```{r}
+#install.packages("FSelector")
+library(FSelector)
+x <- chi.squared(pn_review_score ~ ., data = df.train)
+?chi.squared
+
+cutoff.k(x, 10) ### 영향력 크기 상위 10개 변수만 추출해서 조회하기
+
+df.train <- df.train[c(del_period_psy,del_period,del_period_deadline, review_ans_period,)]
+```
+
+
+
+## 1.로지스틱회귀분석 실시(일반화 선형모형: Generalized Linear Model)
+```{r}
+
+glm.fit <- glm(pn_review_score ~ ., data = df.train, family = binomial())
+### 'family' 는 데이터의 분포와 관련 있다
+### - binomial 값은 회귀와 연관됨
+```
+
+## 2.벌점로지스틱 회귀 --> 정규화 회귀모
+- 이 함수에서는 기본적으로 예측 변수를 표준화(스케일링) (standardize = FALSE 일 경우에는 비표준화)해주며, 질적 변수는 자동으로 더미 인코딩해줌 
+- 반응 변수는 필요시 데이터변환(예: log적용)을 통해 데이터의 분포모양을 안정화시킴
+
+## glmnet()함수의 alpha 파라미터
+- alpha 파라미터의 값에 따라 페널티를 부여하는 정도를 다르게 설정함
+- alpha = 0 --> ridge regression model
+- alpha = 1 --> lasso regression model
+- alpha = 0 ~ 1 --> elastic net model
+```{r}
+library(glmnet)
+# model.matrix()를 사용해 알고리즘에 피팅하기전에 특성 및 대상 집합을 만들어 줌
+xx <- model.matrix(pn_review_score ~ ., data = df.train)
+yy <- df.train$pn_review_score
+ 
+glmnet.fit <- glmnet(x = xx, y = yy, family = 'binomial')
+
+```
+
+```{r}
+## 3가지 다른 예측 값
+predict(glmnet.fit, newx =xx, s = c(0.05, 0.1, 0.2), type='class')
+```
+
+
+```{r}
+
+?glmnet::auc
+## 튜닝값 정의
+glmnGrid <- expand.grid(.alpha = c(0, .1, .2,.4, .6, .8, 1), .lambda=seq(.01,.2,length =40))
+
+set.seed(476)
+glmnTuned <- train(df.train, 
+                   y= df.train$pn_review_score, 
+                   method = 'glmnet',
+                   tuneGrid = glmnGrid,
+                   preProc = c('center','scale'),
+                   metric = 'ROC')
+```
+
+
+## - 1.1. 로지스틱회귀계수 확인: 각 계수별 크기, 방향성 확인
+```{r}
+glm.fit 
+#glmnet.fit 
+```
+
+
+
+## - 1.1. 회귀계수와 로지스틱분석 모델의 통계적 유의성 확인
+```{r}
+result <- summary(glm.fit) 
+results_df <-result$coefficients
+
+results_df
+
+write.csv(results_df, "myCSV.csv")
+#write.csv(df2, 'data_anl2.csv')
+#summary(glmnet.fit)
+# - 어떠한 투입변수가 고객의 신용도 예측을 위한 
+#   통계적 유의성(p-value), 크기, 방향성을 가지는 피처가 되는지 확인
+```
+
+
+## 로지스틱분석에 사용한 투입변수 중요도 계산
+### install.packages("caret", dependencies = c("Depends", "Suggests"))
+### - caret 패키지 함수로 변수들간의 상대적인 중요도 계산
+```{r}
+library(caret)
+### exponential 형식 표시되는거 없애기
+options(scipen = 999)
+## 중요도 파악
+impvars = varImp(glm.fit) 
+
+impvars
+impvars %>% arrange(desc(Overall)) 
+
+df <- cbind(newColName = rownames(impvars), impvars)
+rownames(df) <- 1:nrow(df)
+
+df %>% arrange(desc(Overall))
+```
+
+## 단계별 투입모형
+```{r}
+step(glm.fit)
+```
+
+- direction = c("both", "backward", "forward") 이라는 옵션 중에서 하나 사용가능
+- 디폴트 변수투입방법은 direction = "both"로 전진투입과 후진제거방법을 단계적으로 적용하면서 가장 이상적인 변수조합을 찾아줌
+- AIC(Akaike Information Criterion) 또는 BIC(Bayesian Information Criterion)라는 투입변수 손실(penalty)정도가 가낭 낮은 수치를 기록하는 변수조합을 찾아줌
+- trace = FALSE 옵션을 사용하면 최종적인 결과모형을 제시해줌
+
+
+
+
+```{r}
+glm.fit.fw <- step(glm.fit, direction = "forward") #전진선택방법
+summary(glm.fit.fw)
+
+glm.fit.bw <- step(glm.fit, direction = "backward") # 후진제거방법
+summary(glm.fit.bw)
+
+glm.fit.bt <- step(glm.fit, direction = "both", trace= FALSE) # 단계적 방법 
+summary(glm.fit.bt)
+
+```
+
+
+## 도출된 로지스틱 분류모델의 훈련데이터에 대한 우량/불량 확률계산
+```{r}
+glm.prob.train <- predict(glm.fit, df.train, type = "response")
+## TYPE 옵션 더 알아봐야함
+#glm.prob.train 
+```
+
+- type = "response" 옵션으로 우량확률을 산출함
+- glm (로지스틱회귀 알고리즘을 이용)
+- prob (probability: 확률을 계산함)
+- train (훈련데이터를 활용함)
+- 로지스틱분석을 통해 주요한 피처가 파악된 로지스틱 분류모델을 이용해 계산함 
+- 0.5 이하는 불량신용도, 0.5 보다 크면 우량신용도으로 분류한다는 의미임
+
+## 훈련데이터 개별고객의 우량/불량 확률계산값에 팩터형 레이블 반영
+```{r}
+glm.pred.train <- factor(glm.prob.train > .5, levels = c(FALSE, TRUE), 
+                         labels = c(0, 1))
+```
+# - glm (로지스틱회귀 알고리즘을 이용)
+# - pred (predicted: 앞서도출한 확률값을 토대로 우량인지 불량인지 분류실시)
+# - train (훈련데이터를 활용함)
+
+# - 0.5 이하인 경우 -> FALSE: 0이라는 불량 신용도 레이블을 붙여줌
+# - 0.5 보다 큰 경우 -> TRUE: 1이라는 우량 신용도 레이블을 붙여줌
+
+```{r}
+table(glm.pred.train)
+```
+
+## 훈련데이터 상의 실제고객의 우량/불량 성과변수 분포확인
+```{r}
+
+addmargins(table(df.train$pn_review_score))
+
+
+```
+
+## 훈련데이터를 활용한 로지스틱 분류모델과 실제 고객상태간 분류교차비교
+```{r}
+glm.perf.train <- table(glm.pred.train, df.train$pn_review_score,
+                        dnn = c( "TrainRule", "TrainActual"))
+
+```
+# - glm (로지스틱회귀 알고리즘을 이용)
+# - perf (performance: 실제고객상태와 로지스틱 분류모델의 비교결과를 퍼포먼스로 나타냄)
+# - train (훈련데이터를 활용함)
+
+```{r}
+#glm.pred.train 
+#df.train$pn_review_score
+
+glm.perf.train
+addmargins(glm.perf.train)
+
+```
+- confusion matrix: 혼돈표/혼합표/혼동행렬/분류결과/분류행렬/정오표라 부르며, 
+  분류모델의 성능을 평가하기 위한 기준표/비교표로 활용함
+- 훈련데이터에 있는 실제 고객의 우량/불량 상태와
+  로지스틱분류모델에서 분류한 해당 고객의 우량/불량 상태를
+  크로스 체크(교차검증)한 결과표
+
+## 로지스틱분류모델의 훈련(트레이닝)데이터에 대한 분류결과 정확성(Accuracy) 평가
+```{r}
+sum(glm.perf.train) # 훈련데이터 전체 고객수
+sum(diag(glm.perf.train)) # 우량->우량, 불량->불량 정확분류한 사례수 
+sum(diag(glm.perf.train))/sum(glm.perf.train) # 두 지표의 비율차이: 정확도 
+```
+
+## 훈련데이터 학습을 통해 도출한 로지스틱 분류모델을 
+## 검증데이터 상의 고객들에 적용해 우량/불량 확률을 계산함
+```{r}
+glm.prob.test <- predict(glm.fit, df.test, type = "response")
+# glm.prob.test
+```
+- 훈련데이터에 대한 학습을 통해 개발된 로지스틱분류모델을 이용해 계산함 
+- 0.5 이하는 불량신용도, 0.5 보다 크면 우량신용도 분류가능성이 높다는 의미임
+
+## 검증데이터 개별 관찰치의 불량/우량 확률계산값에 팩터형 레이블 반영
+```{r}
+
+glm.pred.test <- factor(glm.prob.test > .5, levels = c(FALSE, TRUE), 
+                        labels = c(0, 1))
+```
+# - 0.5 이하인 경우: FALSE:0 불량 신용도 레이블
+# - 0.5 보다 큰 경우: TRUE:1 우량 신용도  레이블
+
+## 검증데이터 개별 관찰치의 불량/우량 확률계산값에 팩터형 레이블 반영
+
+```{r}
+glm.pred.test <- factor(glm.prob.test > .5, levels = c(FALSE, TRUE), 
+                        labels = c(0, 1))
+#glm.pred.test
+```
+# - 0.5 이하인 경우: FALSE:0 불량 신용도 레이블
+# - 0.5 보다 큰 경우: TRUE:1 우량 신용도  레이블
+
+```{r}
+## 검증데이터 상의 실제고객의 우량/불량 성과변수 분포확인
+addmargins(table(df.test$pn_review_score))
+
+## 검증데이터를 활용한 로지스틱 분류모델과 실제 고객상태간 분류교차비교
+glm.perf.test <- table(glm.pred.test, df.test$pn_review_score,
+                       dnn = c("TestPredicted", "TestActual"))
+glm.perf.test
+addmargins(glm.perf.test)
+# - confusion matrix: 혼돈표/혼합표/혼동행렬/분류결과/분류행렬
+#   분류모델의 성능을 평가하기 위한 기준표/비교표
+# - 검증데이터에 있는 실제 고객의 우량/불량 상태와
+#   로지스틱분류모델에서 분류한 해당 고객의 우량/불량 상태를
+#   크로스 체크한 결과표
+
+## 로지스틱분류모델의 검증(테스트)데이터에 대한 분류결과 정확성(Accuracy) 평가
+sum(glm.perf.test) # 전체 고객수
+sum(diag(glm.perf.test)) # 우량->우량, 불량->불량 정확분류한 사례수 
+sum(diag(glm.perf.test))/sum(glm.perf.test) # 두 지표의 비율차이: 정확도 
+```
+
+
+```{r}
+# 로지스틱 분류모델의 
+# 학습(tain)데이터와 검증(test)데이터 분류정확성 비교
+x <- sum(diag(glm.perf.train))/sum(glm.perf.train) 
+y <- sum(diag(glm.perf.test))/sum(glm.perf.test) 
+
+compare <- c(x, y, y - x)
+names(compare) <- c("trainAccuracy", "testAccuracy", "AccuracyGap")
+
+compare
+round(compare*100, 2)
+```
+
+
+## 로지스틱모델의 성능 종합평가
+## 혼동표 그리기 
+
+```{r}
+library(caret)
+confusionMatrix(glm.perf.test, positive = "1")
+
+```
+
+
+
+
+
+## 로지스틱모델 ROC(Receiver Operating Characteristic) curve 그래프
+# - FPR과 TPR을 각각 x, y축으로 놓은 그래
+# 진양성율(True Positive Rate; TPR) 
+# - TPR = 민감도 = 1 - 위음성율, True Accept Rate 
+# - 실제 1인 사례에 대해 예측모델에서 1로 맞게 예측한 비율 
+# - ex) 실제 신용우량 고객에 대해서 신용우량 고객이라고 진단 함 
+
+# 위양성율(False Positive Rate; FPR) 
+# - FPR = 1 - 특이도, False Accept Rate 
+# - 실제 0인 케이스에 대해 예측모델에서 1로 잘못 예측한 비율 
+# - ex) 실제 신용우량 고객이 아닌데 신용우량 고객이라고 잘못 진단 함 
+```{r}
+
+# install.packages("ROCR")
+library(ROCR)
+
+glm.prob.test <- predict(glm.fit, df.test, type = "response")
+#glm.prob.test
+glm.pred.roc <- prediction(glm.prob.test, df.test$pn_review_score)
+#glm.pred.roc
+
+#par(mfrow = c(1, 4))
+par(family='AppleGothic')
+plot(performance(glm.pred.roc, "tpr", "fpr"),
+     main = "The Logistic Model ROC Curve", colorize = TRUE)
+abline(0,1, col = "red")
+auc <- performance(glm.pred.roc,"auc")
+auc <- unlist(slot(auc, "y.values"))
+auc <- round(auc, 3)
+legend(0.6, 0.4, legend = c(paste0("AUC: ",auc)), 
+       cex = 1, bty = "n", box.col = "white")
+plot(performance(glm.pred.roc, "lift", "rpp"),
+     main = "The Logistic Model Lift chart Curve", colorize = TRUE)
+plot(performance(glm.pred.roc, "prec", "rec"),
+     main = "The Logistic Model Precision / Recall Curve", colorize = TRUE)
+plot(performance(glm.pred.roc, "acc", "cutoff"),
+     main = "The Logistic Model Accuracy / Cutoff Curve")
+# cutoff 그래프는 , colorize = TRUE옵션이 작동하지 않음
+
+#par(mfrow = c(1, 1))
+
+
+cat("로지스틱 회귀분석 AUC 면적:", 
+    attr(performance(glm.pred.roc, "auc"), "y.values")[[1]])
+
+
+```
+
+## ROC커브의 아래 면적: AUC (Area Under the ROC Curve)
+# - ROC 커브의 X,Y축은 [0,1]의 범위며, (0,0) 에서 (1,1)을 잇는 곡선 
+# - ROC 커브의 밑 면적이 1에 가까울수록(즉, 왼쪽 상단 꼭지점에 다가갈수록) 좋은 성능 
+# - 이때의 면적(AUC)은 0.5~1.0의 범위를 가짐
+# - 0.9~1.0: Excellent
+# - 0.8~0.9: Good
+# - 0.7~0.8: Fair
+# - 0.6~0.7: Poor
+# - 0.6~0.6: Fail
